@@ -7,7 +7,7 @@ from tqdm import tqdm
 ''' global variables and dictionaries'''
 
 # global variables
-bases = [l.upper() for l in 'tcag']
+bases = [l.upper() for l in 'agct']
 bases_pairs = list(itertools.product(bases, bases))
 codons = [a+b+c for a in bases for b in bases for c in bases]
 amino_acids = 'FFLLSSSSYY**CC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG'
@@ -60,6 +60,7 @@ def get_codon_idx_compat(overlap, codon_to_idx):
 # codon compatibility dictionary
 codon_compat_2 = get_codon_idx_compat(2, codon_to_idx) # keys are indices of codon, values are if the 2 codons are compat
 codon_compat_1 = get_codon_idx_compat(1, codon_to_idx)
+
 
 
 
@@ -203,32 +204,53 @@ def brute_force_map(h_mtx, J_mtx):
 
 # brute force find the MAP of double encoding soln
 # this is very slow, only for the purpose for checking correctness
-def brute_force_map_double_encoding(h_mtx_x, J_mtx_x, h_mtx_y, J_mtx_y):
-    assert h_mtx_x.shape[1] == 21
-    L, q = h_mtx_x.shape
-    map_seq_energy = 0 
-    map_seq_x = None
-    map_seq_y = None
-    for nts in itertools.product(bases, repeat=L*3):
+def brute_force_map_double_encoding(h_mtx_x, J_mtx_x, h_mtx_y, J_mtx_y, start_pos):
+    Lx, q = h_mtx_x.shape
+    Ly = h_mtx_y.shape[0]
+    check_start_pos(Lx, Ly, start_pos)
+    
+    map_result = {
+        'energy': 0,
+        'x': None,
+        'y': None,
+        'nt_seq': None
+    }
+
+    for nts in itertools.product(bases, repeat=Lx * 3):
         nt_seq = ''.join(nts)
-        for b in itertools.product(bases, repeat=2):
-            nt_seq_x = b[0] + nt_seq
-            nt_seq_y = nt_seq + b[1]
-            aa_seq_x = translate(nt_seq_x)
-            aa_seq_y = translate(nt_seq_y)
-            energy_x = compute_energy(aa_seq_x, h_mtx_x, J_mtx_x)
-            energy_y = compute_energy(aa_seq_y, h_mtx_y, J_mtx_y)
-            energy = energy_x + energy_y
-            if energy > map_seq_energy:
-                map_seq_x = aa_seq_x
-                map_seq_y = aa_seq_y
-                map_seq_energy = energy
-    return map_seq_x, map_seq_y, map_seq_energy
+        aa_seq_x = translate_nt_to_aa(nt_seq)
+        aa_seq_y = translate_nt_to_aa(nt_seq[start_pos : start_pos + 3 * Ly])
+        energy_x = compute_energy(aa_seq_x, h_mtx_x, J_mtx_x)
+        energy_y = compute_energy(aa_seq_y, h_mtx_y, J_mtx_y)
+        energy = energy_x + energy_y
+        if energy > map_result['energy']:
+            map_result['x'] = aa_seq_x
+            map_result['y'] = aa_seq_y
+            map_result['energy'] = energy
+            map_result['nt_seq'] = nt_seq
+    return map_result
 
 
 
 
-''' sampling functions (for a single potts) '''
+
+''' sampling functions (for double encoding) '''
+# change the subsequence of `wt_seq` starting at `start_pos` (including) of length `len(subseq)` to be `subseq`
+def replace_wt_subseq(wt_seq, subseq, start_pos):
+    assert len(wt_seq) >= len(subseq)
+    assert start_pos + len(subseq) <= len(wt_seq)
+    return wt_seq[:start_pos] + subseq + wt_seq[start_pos + len(subseq):]
+
+
+def check_start_pos(Lx, Ly, start_pos):
+    # x is assumed to be strictly longer than y
+    assert Lx > Ly, 'x needs to be longer than y'
+    # assume nt seq of y can be fully contained in nt seq of x
+    assert start_pos > 0 and start_pos < 3 * (Lx - Ly), 'start_pos needs to be > 0 and < {}'.format(3 * (Lx - Ly))
+    # if the reading frames for x and y overlap exactly, then the amino acids they encode will be exactly the same
+    assert start_pos % 3 != 0, 'reading frames should not overlap exactly'
+
+
 # this computes p(Xi = (a, b, c) | X-i) for all Xi
 # optionally can specify the codons to sum in `codons_to_sum`
 # for each codon k, the numerator of the conditional is the joint probability p(Xi=k, X-i=x-i)
@@ -251,81 +273,118 @@ def compute_conditional_for_position(seq, index, h_mtx, J_mtx, lamb=1, codons_to
 
 
 # conditional sampler for 1 iteration of gibbs sampling for double encoding
-# samples every nt of a sequence
+# samples every nt of a sequence that's within the double encoding region
 # `nt_seq`: a string of nucleotides 
-def conditional_sampler(nt_seq, h_mtx_x, J_mtx_x, h_mtx_y, J_mtx_y, lamb=1):
-    L = h_mtx_x.shape[0]
-    assert len(nt_seq) == 3*L + 1
+def conditional_sampler(nt_seq, h_mtx_x, J_mtx_x, h_mtx_y, J_mtx_y, start_pos, lamb=1):
+    Lx = h_mtx_x.shape[0]
+    Ly = h_mtx_y.shape[0]
     nt_list_tmp = list(nt_seq)
+    # seq_x, seq_y are amino acid sequences of x, y
+    seq_x = translate_nt_to_aa(nt_list_tmp)
+    seq_y = translate_nt_to_aa(nt_list_tmp[start_pos : start_pos + 3 * Ly])
     
-    for i in range(L+1):
-        # sample 1st position of tri-nt (affects Xi, Yi-1)
-        # if i = 0, only affects Xi; if i = L (the last nt), only affects Yi-1
-        if i < L:
-            codons1_x = [''.join([b] + nt_list_tmp[3*i+1:3*i+3]) for b in bases]
-            # TODO: for a different ORF, need to change how seq_x and seq_y are defined
-            seq_x = translate_nt_to_aa(nt_list_tmp[:-1])
-            prob1_x = compute_conditional_for_position(seq_x, i, h_mtx_x, J_mtx_x, lamb=lamb, codons_to_sum=codons1_x)
-        if i > 0:
-            codons1_y = [''.join(nt_list_tmp[3*(i-1)+1:3*i] + [b]) for b in bases]
-            seq_y = translate_nt_to_aa(nt_list_tmp[1:])
-            prob1_y = compute_conditional_for_position(seq_y, i-1, h_mtx_y, J_mtx_y, lamb=lamb, codons_to_sum=codons1_y)
-        
-        if i == 0:
-            prob1 = prob1_x
-        elif i == L:
-            prob1 = prob1_y
-        else:
-            prob1 = np.multiply(prob1_x, prob1_y)
-        prob1 = prob1 / np.sum(prob1)
-        nt1 = np.random.choice(bases, p=prob1)
-        nt_list_tmp[3*i] = nt1
+    # i iterates over amino acidx of y
+    for i in range(Ly):
+        # j iterates over amino acids of x
+        # so 3 * j + k - 1 index the kth nt of the jth codon of x (k = 1, 2, 3)
+        j = start_pos // 3 + i
 
-        if i < L:
-            # sample 2nd and 3rd positions of tri-nt jointly (affects Xi, Yi)
-            codons23_x = [''.join([nt_list_tmp[3*i]] + [bp[0], bp[1]]) for bp in bases_pairs]
-            seq_x = translate_nt_to_aa(nt_list_tmp[:-1])
-            prob23_x = compute_conditional_for_position(seq_x, i, h_mtx_x, J_mtx_x, lamb=lamb, codons_to_sum=codons23_x)
-            codons23_y = [''.join([bp[0], bp[1]] + [nt_list_tmp[3*(i+1)]]) for bp in bases_pairs]
-            seq_y = translate_nt_to_aa(nt_list_tmp[1:])
+        # when reading frames overlap with 2 nts
+        if start_pos % 3 == 1:
+            # conditionals of xj, yi
+            codons23_x = [''.join([nt_list_tmp[3 * j]] + [bp[0], bp[1]]) for bp in bases_pairs]
+            codons23_y = [''.join([bp[0], bp[1]] + [nt_list_tmp[3 * (j + 1)]]) for bp in bases_pairs]
+            prob23_x = compute_conditional_for_position(seq_x, j, h_mtx_x, J_mtx_x, lamb=lamb, codons_to_sum=codons23_x)
             prob23_y = compute_conditional_for_position(seq_y, i, h_mtx_y, J_mtx_y, lamb=lamb, codons_to_sum=codons23_y)
+        
+            # sample sj_2, sj_3 (the 1st, 2nd positions of the yi tri-nt)
             prob23 = np.multiply(prob23_x, prob23_y)
             prob23 = prob23 / np.sum(prob23)
             nt23 = bases_pairs[np.random.choice(np.arange(16), p=prob23)]
-            nt_list_tmp[3*i+1] = nt23[0]
-            nt_list_tmp[3*i+2] = nt23[1]
+            nt_list_tmp[3 * j + 1] = nt23[0]
+            nt_list_tmp[3 * j + 2] = nt23[1]
+        
+            # conditionals of xj+1, yi
+            codons1_x = [''.join([b] + nt_list_tmp[3 * (j + 1) + 1 : 3 * (j + 2)]) for b in bases]
+            codons1_y = [''.join(nt_list_tmp[3 * j + 1 : 3 * (j + 1)] + [b]) for b in bases]
+            prob1_x = compute_conditional_for_position(seq_x, j + 1, h_mtx_x, J_mtx_x, lamb=lamb, codons_to_sum=codons1_x)
+            prob1_y = compute_conditional_for_position(seq_y, i, h_mtx_y, J_mtx_y, lamb=lamb, codons_to_sum=codons1_y)
+            
+            # sample sj+1_1 (the 3rd position of the yi tri-nt)
+            prob1 = np.multiply(prob1_x, prob1_y)
+            prob1 = prob1 / np.sum(prob1)
+            nt1 = np.random.choice(bases, p=prob1)
+            nt_list_tmp[3 * (j + 1)] = nt1
+            
+        # when reading frames overlap with 1 nt
+        elif start_pos % 3 == 2:
+            # conditionals of xj, yi
+            codons3_x = [''.join(nt_list_tmp[3 * j : 3 * j + 2] + [b]) for b in bases]
+            codons3_y = [''.join([b] + nt_list_tmp[3 * (j + 1) : 3 * (j + 1) + 2]) for b in bases]
+            prob3_x = compute_conditional_for_position(seq_x, j, h_mtx_x, J_mtx_x, lamb=lamb, codons_to_sum=codons3_x)
+            prob3_y = compute_conditional_for_position(seq_y, i, h_mtx_y, J_mtx_y, lamb=lamb, codons_to_sum=codons3_y)
+
+            # sample sj_3 (the 1st position of the yi tri-nt)
+            prob3 = np.multiply(prob3_x, prob3_y)
+            prob3 = prob3 / np.sum(prob3)
+            nt3 = np.random.choice(bases, p=prob3)
+            nt_list_tmp[3 * j + 2] = nt3
+            
+            # conditionals of xj+1, yi
+            codons12_x = [''.join([bp[0], bp[1]] + [nt_list_tmp[3 * (j + 1) + 2]]) for bp in bases_pairs]
+            codons12_y = [''.join([nt_list_tmp[3 * j + 2]] + [bp[0], bp[1]]) for bp in bases_pairs]
+            prob12_x = compute_conditional_for_position(seq_x, j + 1, h_mtx_x, J_mtx_x, lamb=lamb, codons_to_sum=codons12_x)
+            prob12_y = compute_conditional_for_position(seq_y, i, h_mtx_y, J_mtx_y, lamb=lamb, codons_to_sum=codons12_y)
+        
+            # sample sj+1_1, sj+1_2 (the 2nd, 3rd position of the yi tri_nt)
+            prob12 = np.multiply(prob12_x, prob12_y)
+            prob12 = prob12 / np.sum(prob12)
+            nt12 = bases_pairs[np.random.choice(np.arange(16), p=prob12)]
+            nt_list_tmp[3 * (j + 1)] = nt12[0]
+            nt_list_tmp[3 * (j + 1) + 1] = nt12[1]
     
     return ''.join(nt_list_tmp)
 
 
-def gibbs_sampler(L, h_mtx_x, J_mtx_x, h_mtx_y, J_mtx_y, lamb=1, num_iter=100000, nt_seq_init=None):
+# sample nt seq s of length 3|x|, where x is obtained by translating the entire sequence s
+# y is obtained by translating the length 3|y| subsequence of s that starts at `start_pos`
+# `wt_nt_seq` is the WT *nt* sequence of x
+# `start_pos` is the starting position of double encoding in nucleotide index
+# note: we sample assuming the reading frames overlap with either 1 or 2 nts
+def gibbs_sampler(h_mtx_x, J_mtx_x, h_mtx_y, J_mtx_y, wt_nt_seq, start_pos, lamb=1, num_iter=100000, nt_seq_init=None):
+    # note: Lx, Ly are lengths of *amino acid sequences*, to get nucleotide sequence length, multiply by 3
+    Lx = h_mtx_x.shape[0]
+    Ly = h_mtx_y.shape[0]
+    check_start_pos(Lx, Ly, start_pos)
+    assert Lx * 3 == len(wt_nt_seq), 'length of wt_nt_seq needs to be {}'.format(Lx * 3)
+
     if nt_seq_init is None:
-        nt_seq = sample_nt_seq(3*L+1)
+        nt_seq = sample_nt_seq(3 * Ly)
+        nt_seq = replace_wt_subseq(wt_nt_seq, nt_seq, start_pos)
     else:
+        assert len(nt_seq_init) == len(wt_nt_seq)
         nt_seq = nt_seq_init
+
     nt_seq_samples = [None for i in range(num_iter+1)]
-    nt_seq_samples[0] = nt_seq
     energy_x_samples = np.zeros(num_iter+1)
     energy_y_samples = np.zeros(num_iter+1)
-
-    seq_x = translate_nt_to_aa(nt_seq[:-1])
-    seq_y = translate_nt_to_aa(nt_seq[1:])
-    energy_x = compute_energy(seq_x, h_mtx_x, J_mtx_x)
-    energy_y = compute_energy(seq_y, h_mtx_y, J_mtx_y)
-    energy_x_samples[0] = energy_x
-    energy_y_samples[0] = energy_y
     
-    for i in tqdm(range(1, num_iter+1)):
-        nt_seq = conditional_sampler(nt_seq, h_mtx_x, J_mtx_x, h_mtx_y, J_mtx_y, lamb=lamb)
+    for i in tqdm(range(num_iter+1)):
+        if i > 0:
+            nt_seq = conditional_sampler(nt_seq, h_mtx_x, J_mtx_x, h_mtx_y, J_mtx_y, start_pos, lamb=lamb)
+        # make sure the non-double-encoding region stays the same as the wt
+        assert nt_seq[:start_pos] + nt_seq[start_pos + 3 * Ly:] == wt_nt_seq[:start_pos] + wt_nt_seq[start_pos + 3 * Ly:]
+
         nt_seq_samples[i] = nt_seq
-        seq_x = translate_nt_to_aa(nt_seq[:-1])
-        seq_y = translate_nt_to_aa(nt_seq[1:])
+        seq_x = translate_nt_to_aa(nt_seq)
+        seq_y = translate_nt_to_aa(nt_seq[start_pos : start_pos + 3 * Ly])
         energy_x = compute_energy(seq_x, h_mtx_x, J_mtx_x)
         energy_y = compute_energy(seq_y, h_mtx_y, J_mtx_y)
         energy_x_samples[i] = energy_x
         energy_y_samples[i] = energy_y
     
     return nt_seq_samples, energy_x_samples, energy_y_samples
+
 
 
 
