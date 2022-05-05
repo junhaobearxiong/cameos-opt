@@ -2,6 +2,7 @@ import numpy as np
 import itertools
 import cvxpy as cp
 from tqdm import tqdm
+from scipy.special import logsumexp
 
 
 ''' global variables and dictionaries'''
@@ -10,7 +11,10 @@ from tqdm import tqdm
 bases = [l.upper() for l in 'agct']
 bases_pairs = list(itertools.product(bases, bases))
 codons = [a+b+c for a in bases for b in bases for c in bases]
+# the order of amino acids here is to match `codons`
 amino_acids = 'FFLLSSSSYY**CC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG'
+
+
 
 # global dictionary
 # 'idx' here are used for indexing everywhere, in particular for indexing h, J
@@ -26,7 +30,8 @@ idx_to_codon = dict(zip(np.arange(64), codons))
 
 
 # amino acids and indices
-unique_amino_acids = np.unique([a for a in amino_acids])
+# the order of amino acids and indices here is used to match `convert_protein` in bio_seq.jl
+unique_amino_acids = list('ARNDCQEGHILKMFPSTWYV*')
 # the map between idx in h, J and aa's might depend on the specific ways we get h and J
 # so don't define as globals
 aa_to_idx = dict(zip(unique_amino_acids, np.arange(21))) 
@@ -87,12 +92,27 @@ def translate_nt_to_aa(nt_seq):
     return translate_codon_to_aa(translate_nt_to_codon(nt_seq))
 
 
-# implement calculation of energy / pseudolikelihood
-# TODO: this is naive, can probably optimize by reformating h and J and do matrix multiplication
-# be careful: i need to know which rows of h and J correspond to which amino acids
+# for length L amino acid seq, get a 21 * L one-hot encoding of seq
+# where the amino acids are indexed in the same order as `aa_to_idx`
+def convert_seq_one_hot(seq):
+    one_hot_seq = np.zeros(21 * len(seq))
+    for i, aa in enumerate(seq):
+        one_hot_seq[i * 21 + aa_to_idx[aa]] = 1
+    return one_hot_seq
+
+
 # compute energy given an amino acid sequence, represented as a string
+# note: to match cameos implementation, a pair of position is counted twice in the energy calculation 
 def compute_energy(seq, h_mtx, J_mtx):
-    # check that h, J are defined for the length of this sequence
+    assert h_mtx.size == len(seq) * 21
+    assert J_mtx.shape[0] == len(seq) * 21
+    assert J_mtx.shape[1] == len(seq) * 21
+    assert len(J_mtx.shape) == 2
+
+    seq_one_hot = convert_seq_one_hot(seq)
+    return seq_one_hot @ h_mtx + seq_one_hot @ J_mtx @ seq_one_hot
+
+    '''
     assert len(seq) == h_mtx.shape[0]
     assert len(seq) == J_mtx.shape[0]
     assert len(seq) == J_mtx.shape[1]
@@ -106,7 +126,7 @@ def compute_energy(seq, h_mtx, J_mtx):
     J_values = J_mtx[pairs_as_list[0], pairs_as_list[1], J_idx[0], J_idx[1]]
     
     return np.sum(h_values) + np.sum(J_values)
-
+    '''
 
 
 
@@ -157,22 +177,25 @@ def convert_mu_codon_to_seq(mu):
 
 ''' simulation utils functions '''
 # implement sampling of h, J
+# h is a L * q vector
 def sample_h(L, q):
     h_mtx = np.random.normal(0, 1, (L, q))
-    return h_mtx
+    h_mtx[:, -1] = 0
+    return h_mtx.reshape(L * q)
 
 
+# J is L*q by L*q matrix
 def sample_J(L, q):
-    J_mtx = np.random.normal(0, 1, (L, L, q, q))
-    # enforces each Jij is symmetric
-    for i in range(L):
-        for j in range(L):
-            J_mtx[i, j] = 0.5 * (J_mtx[i, j] + J_mtx[i, j].T)
+    J_mtx = np.random.normal(0, 1, (L * q, L * q))
     # enforces Jij = Jji.T
-    J_mtx_sym = np.zeros((L, L, q, q))
+    J_mtx_sym = np.zeros((L * q, L * q))
     for i in range(L):
         for j in range(L):
-            J_mtx_sym[i, j] = 0.5 * (J_mtx[i, j] + J_mtx[j, i].T)
+            if i != j:
+                Jij = J_mtx[i * q : (i + 1) * q, j * q : (j + 1) * q] # 21-by-21
+                Jji = J_mtx[j * q : (j + 1) * q, i * q : (i + 1) * q] # 21-by-21
+                J_mtx_sym[i * q : (i + 1) * q, j * q : (j + 1) * q] = 0.5 * (Jij + Jji)
+                J_mtx_sym[j * q : (j + 1) * q, i * q : (i + 1) * q] = 0.5 * (Jij + Jji).T
     return J_mtx_sym
 
 
@@ -190,7 +213,8 @@ def sample_aa_seq(L):
 
 # brute force find the MAP, for checking correctness
 def brute_force_map(h_mtx, J_mtx):
-    L, q = h_mtx.shape
+    q = 21
+    L = int(h_mtx.size / q)
     map_seq_energy = 0 
     map_seq = None
     for idx in itertools.product(np.arange(q), repeat=L):
@@ -205,8 +229,8 @@ def brute_force_map(h_mtx, J_mtx):
 # brute force find the MAP of double encoding soln
 # this is very slow, only for the purpose for checking correctness
 def brute_force_map_double_encoding(h_mtx_x, J_mtx_x, h_mtx_y, J_mtx_y, start_pos):
-    Lx, q = h_mtx_x.shape
-    Ly = h_mtx_y.shape[0]
+    Lx = int(h_mtx_x.size / 21)
+    Ly = int(h_mtx_y.size / 21)
     check_start_pos(Lx, Ly, start_pos)
     
     map_result = {
@@ -269,22 +293,22 @@ def compute_conditional_for_position(seq, index, h_mtx, J_mtx, lamb=1, codons_to
         energy_arr[i] = compute_energy(''.join(seq_tmp), h_mtx, J_mtx)
     
     energy_arr *= lamb
-    return np.exp(energy_arr) / np.sum(np.exp(energy_arr))
+    return np.exp(energy_arr - logsumexp(energy_arr))
 
 
 # conditional sampler for 1 iteration of gibbs sampling for double encoding
 # samples every nt of a sequence that's within the double encoding region
 # `nt_seq`: a string of nucleotides 
 def conditional_sampler(nt_seq, h_mtx_x, J_mtx_x, h_mtx_y, J_mtx_y, start_pos, lamb=1):
-    Lx = h_mtx_x.shape[0]
-    Ly = h_mtx_y.shape[0]
+    Lx = int(h_mtx_x.size / 21)
+    Ly = int(h_mtx_y.size / 21)
     nt_list_tmp = list(nt_seq)
     # seq_x, seq_y are amino acid sequences of x, y
     seq_x = translate_nt_to_aa(nt_list_tmp)
     seq_y = translate_nt_to_aa(nt_list_tmp[start_pos : start_pos + 3 * Ly])
     
     # i iterates over amino acidx of y
-    for i in range(Ly):
+    for i in tqdm(range(Ly)):
         # j iterates over amino acids of x
         # so 3 * j + k - 1 index the kth nt of the jth codon of x (k = 1, 2, 3)
         j = start_pos // 3 + i
@@ -353,8 +377,8 @@ def conditional_sampler(nt_seq, h_mtx_x, J_mtx_x, h_mtx_y, J_mtx_y, start_pos, l
 # note: we sample assuming the reading frames overlap with either 1 or 2 nts
 def gibbs_sampler(h_mtx_x, J_mtx_x, h_mtx_y, J_mtx_y, wt_nt_seq, start_pos, lamb=1, num_iter=100000, nt_seq_init=None):
     # note: Lx, Ly are lengths of *amino acid sequences*, to get nucleotide sequence length, multiply by 3
-    Lx = h_mtx_x.shape[0]
-    Ly = h_mtx_y.shape[0]
+    Lx = int(h_mtx_x.size / 21)
+    Ly = int(h_mtx_y.size / 21)
     check_start_pos(Lx, Ly, start_pos)
     assert Lx * 3 == len(wt_nt_seq), 'length of wt_nt_seq needs to be {}'.format(Lx * 3)
 
@@ -393,8 +417,8 @@ def gibbs_sampler(h_mtx_x, J_mtx_x, h_mtx_y, J_mtx_y, wt_nt_seq, start_pos, lamb
 # ILP MAP calculation for one potts
 # boolean=True: ILP
 def lp_map(h_mtx, J_mtx, boolean=True):
-    L = h_mtx.shape[0]
-    q = h_mtx.shape[1]
+    q = 21
+    L = int(h_mtx.size / q)
     mu_ind = cp.Variable((L, q), boolean=boolean) # variable for each individual position
     mu_pairs = [cp.Variable((q, q), boolean=boolean) for _ in range(int(L*(L-1)/2))]
     mu_pair_dict = dict(zip(itertools.combinations(np.arange(L), 2), mu_pairs)) # variables for each pair of positions
@@ -430,13 +454,13 @@ def lp_map(h_mtx, J_mtx, boolean=True):
 
 
 # double encoding MAP using ILP / LP
-# TODO: this assumes the ORF has overlap 1, for ORF with overlap 2, needs to change how the compat constraints are defined 
+# TODO: this assumes the proteins have the same length, and the ORF has overlap 1 
+# TODO: redo how codons are converted
 def double_encode_lp_map(h_mtx_x, J_mtx_x, h_mtx_y, J_mtx_y, boolean=True):
-    assert h_mtx_x.shape == h_mtx_y.shape
-    assert J_mtx_x.shape == J_mtx_y.shape
-    assert h_mtx_x.shape[1] == 64 # for double encoding, we need to work in the space of codon
-    L = h_mtx_x.shape[0]
-    q = h_mtx_x.shape[1] 
+    # for double encoding, we need to work in the space of codon
+    q = 64
+    Lx = int(h_mtx_x.size / q)
+    Ly = int(h_mtx_y.size / q)
 
     mu_ind_x = cp.Variable((L, q), boolean=boolean) # variable for each individual position
     mu_pairs_x = [cp.Variable((q, q), boolean=boolean) for _ in range(int(L*(L-1)/2))] # variables for each pair of positions
