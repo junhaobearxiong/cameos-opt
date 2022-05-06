@@ -30,7 +30,7 @@ idx_to_codon = dict(zip(np.arange(64), codons))
 
 
 # amino acids and indices
-# the order of amino acids and indices here is used to match `convert_protein` in bio_seq.jl
+# the order of amino acids and indices here is used to match `convert_protein` in bio_seq.jl of cameos
 unique_amino_acids = list('ARNDCQEGHILKMFPSTWYV*')
 # the map between idx in h, J and aa's might depend on the specific ways we get h and J
 # so don't define as globals
@@ -50,7 +50,7 @@ for i, aa in enumerate(amino_acids):
 
 # calculate compatibility on codon level: 4^3 x 4^3 pairs
 # order matters! the first codon is assumed to start first
-def get_codon_idx_compat(overlap, codon_to_idx):
+def get_codon_idx_compat(overlap):
     assert overlap == 1 or overlap == 2
     compat_dict = {}
     for c1 in codon_to_idx.keys():
@@ -63,8 +63,8 @@ def get_codon_idx_compat(overlap, codon_to_idx):
     return compat_dict
 
 # codon compatibility dictionary
-codon_compat_2 = get_codon_idx_compat(2, codon_to_idx) # keys are indices of codon, values are if the 2 codons are compat
-codon_compat_1 = get_codon_idx_compat(1, codon_to_idx)
+codon_compat_2 = get_codon_idx_compat(2) # keys are indices of codon, values are if the 2 codons are compat
+codon_compat_1 = get_codon_idx_compat(1)
 
 
 
@@ -102,7 +102,7 @@ def convert_seq_one_hot(seq):
 
 
 # compute energy given an amino acid sequence, represented as a string
-# note: to match cameos implementation, a pair of position is counted twice in the energy calculation 
+# note: to match cameos implementation (mrf.jl: basic_energy_calc), a pair of position is counted twice in the energy calculation 
 def compute_energy(seq, h_mtx, J_mtx):
     assert h_mtx.size == len(seq) * 21
     assert J_mtx.shape[0] == len(seq) * 21
@@ -140,26 +140,28 @@ def convert_mu_to_seq(mu):
 
 
 # project h, J to codon space, i.e. q = 64
-def convert_h_to_codon_space(h_mtx, idx_to_aa):
-    h_mtx_codon = np.zeros((h_mtx.shape[0], 64))
-    for i in range(h_mtx.shape[0]):
-        for j in range(h_mtx.shape[1]):
+# return: h_mtx_codon is L by q
+def convert_h_to_codon_space(h_mtx):
+    L = int(h_mtx.size / 21)
+    h_mtx_codon = np.zeros((L, 64))
+    for i in range(L):
+        for j in range(21):
             for codon in aa_to_codons[idx_to_aa[j]]:
-                h_mtx_codon[i, codon_to_idx[codon]] = h_mtx[i, j]
+                h_mtx_codon[i, codon_to_idx[codon]] = h_mtx[i * 21 + j]
     return h_mtx_codon
 
 
-def convert_J_to_codon_space(J_mtx, idx_to_aa):
-    L = J_mtx.shape[0]
-    q = J_mtx.shape[2]
+# return: J_mtx_codon is L by L by q by q
+def convert_J_to_codon_space(J_mtx):
+    L = int(J_mtx.shape[0] / 21)
     J_mtx_codon = np.zeros((L, L, 64, 64))
     for i in range(L):
         for j in range(L):
-            for k in range(q):
-                for l in range(q):
+            for k in range(21):
+                for l in range(21):
                     for c1 in aa_to_codons[idx_to_aa[k]]:
                         for c2 in aa_to_codons[idx_to_aa[l]]:
-                            J_mtx_codon[i, j, codon_to_idx[c1], codon_to_idx[c2]] = J_mtx[i, j, k, l]
+                            J_mtx_codon[i, j, codon_to_idx[c1], codon_to_idx[c2]] = J_mtx[i * 21 + k, j * 21 + l]
     return J_mtx_codon
 
 
@@ -228,11 +230,12 @@ def brute_force_map(h_mtx, J_mtx):
 
 # brute force find the MAP of double encoding soln
 # this is very slow, only for the purpose for checking correctness
-def brute_force_map_double_encoding(h_mtx_x, J_mtx_x, h_mtx_y, J_mtx_y, start_pos):
+# if `wt_nt_seq` is given, the map is conditioning on the wt sequence outside the double encoding region
+def brute_force_map_double_encoding(h_mtx_x, J_mtx_x, h_mtx_y, J_mtx_y, start_pos, wt_nt_seq=None):
     Lx = int(h_mtx_x.size / 21)
     Ly = int(h_mtx_y.size / 21)
     check_start_pos(Lx, Ly, start_pos)
-    
+
     map_result = {
         'energy': 0,
         'x': None,
@@ -240,8 +243,18 @@ def brute_force_map_double_encoding(h_mtx_x, J_mtx_x, h_mtx_y, J_mtx_y, start_po
         'nt_seq': None
     }
 
-    for nts in itertools.product(bases, repeat=Lx * 3):
-        nt_seq = ''.join(nts)
+    if wt_nt_seq is None:
+        all_nts = list(itertools.product(bases, repeat=Lx * 3))
+    else:
+        assert Lx * 3 == len(wt_nt_seq), 'length of wt_nt_seq needs to be {}'.format(Lx * 3)
+        all_nts = list(itertools.product(bases, repeat=Ly * 3))
+
+    for nts in all_nts:
+        if wt_nt_seq is None:
+            nt_seq = ''.join(nts)
+        else:
+            nt_seq = ''.join(wt_nt_seq[:start_pos] + ''.join(nts) + wt_nt_seq[start_pos + 3 * Ly:])
+
         aa_seq_x = translate_nt_to_aa(nt_seq)
         aa_seq_y = translate_nt_to_aa(nt_seq[start_pos : start_pos + 3 * Ly])
         energy_x = compute_energy(aa_seq_x, h_mtx_x, J_mtx_x)
@@ -251,7 +264,8 @@ def brute_force_map_double_encoding(h_mtx_x, J_mtx_x, h_mtx_y, J_mtx_y, start_po
             map_result['x'] = aa_seq_x
             map_result['y'] = aa_seq_y
             map_result['energy'] = energy
-            map_result['nt_seq'] = nt_seq
+            map_result['nt_seq'] = nt_seq          
+
     return map_result
 
 
@@ -454,20 +468,19 @@ def lp_map(h_mtx, J_mtx, boolean=True):
 
 
 # double encoding MAP using ILP / LP
-# TODO: this assumes the proteins have the same length, and the ORF has overlap 1 
-# TODO: redo how codons are converted
-def double_encode_lp_map(h_mtx_x, J_mtx_x, h_mtx_y, J_mtx_y, boolean=True):
+def double_encode_lp_map(h_mtx_x, J_mtx_x, h_mtx_y, J_mtx_y, start_pos, wt_nt_seq, boolean=True):
     # for double encoding, we need to work in the space of codon
     q = 64
-    Lx = int(h_mtx_x.size / q)
-    Ly = int(h_mtx_y.size / q)
+    Lx = h_mtx_x.shape[0]
+    Ly = h_mtx_y.shape[0]
+    check_start_pos(Lx, Ly, start_pos)
 
-    mu_ind_x = cp.Variable((L, q), boolean=boolean) # variable for each individual position
-    mu_pairs_x = [cp.Variable((q, q), boolean=boolean) for _ in range(int(L*(L-1)/2))] # variables for each pair of positions
-    mu_pair_dict_x = dict(zip(itertools.combinations(np.arange(L), 2), mu_pairs_x))
-    mu_ind_y = cp.Variable((L, q), boolean=boolean)
-    mu_pairs_y = [cp.Variable((q, q), boolean=boolean) for _ in range(int(L*(L-1)/2))]
-    mu_pair_dict_y = dict(zip(itertools.combinations(np.arange(L), 2), mu_pairs_y)) 
+    mu_ind_x = cp.Variable((Lx, q), boolean=boolean) # variable for each individual position
+    mu_pairs_x = [cp.Variable((q, q), boolean=boolean) for _ in range(int(Lx * (Lx - 1) / 2))] # variables for each pair of positions
+    mu_pair_dict_x = dict(zip(itertools.combinations(np.arange(Lx), 2), mu_pairs_x))
+    mu_ind_y = cp.Variable((Ly, q), boolean=boolean)
+    mu_pairs_y = [cp.Variable((q, q), boolean=boolean) for _ in range(int(Ly * (Ly - 1) / 2))]
+    mu_pair_dict_y = dict(zip(itertools.combinations(np.arange(Ly), 2), mu_pairs_y)) 
 
     constraints_ind = [
         cp.sum(mu_ind_x, axis=1) == 1, # marginal constraints
@@ -506,24 +519,92 @@ def double_encode_lp_map(h_mtx_x, J_mtx_x, h_mtx_y, J_mtx_y, boolean=True):
         cp.sum(mu, axis=1) == mu_ind_y[idx[0]] for idx, mu in mu_pair_dict_y.items() # consistency constraints for 1st position
     ]
     
-    # coupling constraints
-    constraints_cp = [
-        mu_ind_x[:, idx[0]] + mu_ind_y[:, idx[1]] <= 1
-        for idx, compat in codon_compat_2.items()
-        if not compat
-    ]
-    constraints_cp += [
-        mu_ind_x[1:, idx[1]] + mu_ind_y[:-1, idx[0]] <= 1
-        for idx, compat in codon_compat_1.items()
-        if not compat
-    ]
     
-    constraints = constraints_ind + constraints_pair + constraints_cp
+    start_pos_x = start_pos // 3 # the corresponding index in x of the starting position
+    
+    # constrain the assignments of x before the double-encoding region
+    constraints_wt = []
+    if start_pos_x > 0:
+        constraints_wt += [
+            mu_ind_x[i, codon_to_idx[wt_nt_seq[i * 3 : (i + 1) * 3]]] == 1 for i in range(start_pos_x)
+        ]
+        constraints_wt += [
+            mu_ind_x[i, :codon_to_idx[wt_nt_seq[i * 3 : (i + 1) * 3]]] == 0 for i in range(start_pos_x)
+        ]
+        constraints_wt += [
+            mu_ind_x[i, codon_to_idx[wt_nt_seq[i * 3 : (i + 1) * 3]] + 1:] == 0 for i in range(start_pos_x)
+            if codon_to_idx[wt_nt_seq[i * 3 : (i + 1) * 3]] < q - 1
+        ]
+        
+    # constrain the assignments of x after the double-encoding region
+    if start_pos_x + Ly < Lx - 1:
+        constraints_wt += [
+            mu_ind_x[i, codon_to_idx[wt_nt_seq[i * 3 : (i + 1) * 3]]] for i in range(start_pos_x + Ly + 1, Lx)
+        ]
+        constraints_wt += [
+            mu_ind_x[i, :codon_to_idx[wt_nt_seq[i * 3 : (i + 1) * 3]]] for i in range(start_pos_x + Ly + 1, Lx)
+        ]
+        constraints_wt += [
+            mu_ind_x[i, codon_to_idx[wt_nt_seq[i * 3 : (i + 1) * 3]] + 1:] for i in range(start_pos_x + Ly + 1, Lx)
+            if codon_to_idx[wt_nt_seq[i * 3 : (i + 1) * 3]] < q - 1
+        ]
+        
+    # constrain the first and last codon of x in the double encoding region 
+    first_overlap_codon = wt_nt_seq[start_pos_x * 3 : (start_pos_x + 1) * 3]
+    last_overlap_codon = wt_nt_seq[(start_pos_x + Ly) * 3 : (start_pos_x + Ly + 1) * 3]
+    if start_pos % 3 == 1:
+        constraints_wt += [
+            mu_ind_x[start_pos_x, i] == 0 for i in range(64)
+            if idx_to_codon[i][0] != first_overlap_codon[0]
+        ]
+        constraints_wt += [
+            mu_ind_x[start_pos_x + Ly, i] == 0 for i in range(64)
+            if idx_to_codon[i][1:] != last_overlap_codon[1:]
+        ]
+    elif start_pos % 3 == 2:
+        constraints_wt += [
+            mu_ind_x[start_pos_x, i] == 0 for i in range(64)
+            if idx_to_codon[i][1:] != first_overlap_codon[1:]
+        ]
+        constraints_wt += [
+            mu_ind_x[start_pos_x + Ly, i] == 0 for i in range(64)
+            if idx_to_codon[i][-1] != last_overlap_codon[-1]
+        ]
+    
+    
+    # constrain the compatibility of overlapping codons, depending on how the reading frames overlap
+    constraints_cp = []
+    if start_pos % 3 == 1:
+        # coupling constraints
+        constraints_cp += [
+            mu_ind_x[start_pos_x : start_pos_x + Ly, idx[0]] + mu_ind_y[:, idx[1]] <= 1
+            for idx, compat in codon_compat_2.items()
+            if not compat
+        ]
+        constraints_cp += [
+            mu_ind_y[:, idx[0]] + mu_ind_x[start_pos_x + 1 : start_pos_x + Ly + 1, idx[1]] <= 1
+            for idx, compat in codon_compat_1.items()
+            if not compat
+        ]
+    elif start_pos % 3 == 2:
+        constraints_cp += [
+            mu_ind_x[start_pos_x : start_pos_x + Ly, idx[0]] + mu_ind_y[:, idx[1]] <= 1
+            for idx, compat in codon_compat_1.items()
+            if not compat
+        ]
+        constraints_cp += [
+            mu_ind_y[:, idx[0]] + mu_ind_x[start_pos_x + 1 : start_pos_x + Ly + 1, idx[1]] <= 1
+            for idx, compat in codon_compat_2.items()
+            if not compat
+        ]
+    
+    constraints = constraints_ind + constraints_pair + constraints_wt + constraints_cp
     
     obj_ind_x = cp.sum(cp.multiply(h_mtx_x, mu_ind_x))
-    obj_pair_x = cp.sum([cp.sum(cp.multiply(J_mtx_x[idx[0], idx[1]], mu)) for idx, mu in mu_pair_dict_x.items()])
+    # times 2 to match cameos implementation of energy calculation
+    obj_pair_x = 2 * cp.sum([cp.sum(cp.multiply(J_mtx_x[idx[0], idx[1]], mu)) for idx, mu in mu_pair_dict_x.items()])
     obj_ind_y = cp.sum(cp.multiply(h_mtx_y, mu_ind_y))
-    obj_pair_y = cp.sum([cp.sum(cp.multiply(J_mtx_y[idx[0], idx[1]], mu)) for idx, mu in mu_pair_dict_y.items()])
+    obj_pair_y = 2 * cp.sum([cp.sum(cp.multiply(J_mtx_y[idx[0], idx[1]], mu)) for idx, mu in mu_pair_dict_y.items()])
 
     obj = cp.Maximize(obj_ind_x + obj_pair_x + obj_ind_y + obj_pair_y)
     prob = cp.Problem(obj, constraints)
