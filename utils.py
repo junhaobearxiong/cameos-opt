@@ -231,16 +231,24 @@ def brute_force_map(h_mtx, J_mtx):
 # brute force find the MAP of double encoding soln
 # this is very slow, only for the purpose for checking correctness
 # if `wt_nt_seq` is given, the map is conditioning on the wt sequence outside the double encoding region
-def brute_force_map_double_encoding(h_mtx_x, J_mtx_x, h_mtx_y, J_mtx_y, start_pos, wt_nt_seq=None):
+def brute_force_map_double_encoding(h_mtx_x, J_mtx_x, h_mtx_y, J_mtx_y, start_pos=None, wt_nt_seq=None):
+    print('brute force map given start_pos={}, wt_nt_seq={}'.format(start_pos, wt_nt_seq))
+
     Lx = int(h_mtx_x.size / 21)
     Ly = int(h_mtx_y.size / 21)
-    check_start_pos(Lx, Ly, start_pos)
+
+    if start_pos is None:
+        all_start_pos = [i for i in range(3 * (Lx - Ly)) if i % 3 != 0]
+    else:
+        check_start_pos(Lx, Ly, start_pos)
+        all_start_pos = [start_pos]
 
     map_result = {
         'energy': 0,
         'x': None,
         'y': None,
-        'nt_seq': None
+        'nt_seq': None,
+        'start_pos': None
     }
 
     if wt_nt_seq is None:
@@ -249,22 +257,24 @@ def brute_force_map_double_encoding(h_mtx_x, J_mtx_x, h_mtx_y, J_mtx_y, start_po
         assert Lx * 3 == len(wt_nt_seq), 'length of wt_nt_seq needs to be {}'.format(Lx * 3)
         all_nts = list(itertools.product(bases, repeat=Ly * 3))
 
-    for nts in all_nts:
-        if wt_nt_seq is None:
-            nt_seq = ''.join(nts)
-        else:
-            nt_seq = ''.join(wt_nt_seq[:start_pos] + ''.join(nts) + wt_nt_seq[start_pos + 3 * Ly:])
+    for start_pos in all_start_pos:
+        for nts in all_nts:
+            if wt_nt_seq is None:
+                nt_seq = ''.join(nts)
+            else:
+                nt_seq = ''.join(wt_nt_seq[:start_pos] + ''.join(nts) + wt_nt_seq[start_pos + 3 * Ly:])
 
-        aa_seq_x = translate_nt_to_aa(nt_seq)
-        aa_seq_y = translate_nt_to_aa(nt_seq[start_pos : start_pos + 3 * Ly])
-        energy_x = compute_energy(aa_seq_x, h_mtx_x, J_mtx_x)
-        energy_y = compute_energy(aa_seq_y, h_mtx_y, J_mtx_y)
-        energy = energy_x + energy_y
-        if energy > map_result['energy']:
-            map_result['x'] = aa_seq_x
-            map_result['y'] = aa_seq_y
-            map_result['energy'] = energy
-            map_result['nt_seq'] = nt_seq          
+            aa_seq_x = translate_nt_to_aa(nt_seq)
+            aa_seq_y = translate_nt_to_aa(nt_seq[start_pos : start_pos + 3 * Ly])
+            energy_x = compute_energy(aa_seq_x, h_mtx_x, J_mtx_x)
+            energy_y = compute_energy(aa_seq_y, h_mtx_y, J_mtx_y)
+            energy = energy_x + energy_y
+            if energy > map_result['energy']:
+                map_result['x'] = aa_seq_x
+                map_result['y'] = aa_seq_y
+                map_result['energy'] = energy
+                map_result['nt_seq'] = nt_seq
+                map_result['start_pos'] = start_pos 
 
     return map_result
 
@@ -322,7 +332,7 @@ def conditional_sampler(nt_seq, h_mtx_x, J_mtx_x, h_mtx_y, J_mtx_y, start_pos, l
     seq_y = translate_nt_to_aa(nt_list_tmp[start_pos : start_pos + 3 * Ly])
     
     # i iterates over amino acidx of y
-    for i in tqdm(range(Ly)):
+    for i in range(Ly):
         # j iterates over amino acids of x
         # so 3 * j + k - 1 index the kth nt of the jth codon of x (k = 1, 2, 3)
         j = start_pos // 3 + i
@@ -384,34 +394,63 @@ def conditional_sampler(nt_seq, h_mtx_x, J_mtx_x, h_mtx_y, J_mtx_y, start_pos, l
     return ''.join(nt_list_tmp)
 
 
+# sample over the possible double encoding starting positions given Lx, Ly
+# `prob`: probability distribution over the *allowed* starting positions, sample uniformly if None 
+def sample_start_pos(Lx, Ly, num_samples, prob=None):
+    all_start_pos = [i for i in range(3 * (Lx - Ly)) if i % 3 != 0]
+    if prob is not None:
+        prob = np.array(prob)
+        assert prob.size == len(all_start_pos), 'distribution of start_pos needs to be over the {} possible positions (see `check_start_pos`)'.format(2 * (Lx - Ly))
+        assert np.sum(prob) == 1
+    return np.random.choice(all_start_pos, size=num_samples, p=prob)
+
+
 # sample nt seq s of length 3|x|, where x is obtained by translating the entire sequence s
 # y is obtained by translating the length 3|y| subsequence of s that starts at `start_pos`
 # `wt_nt_seq` is the WT *nt* sequence of x
-# `start_pos` is the starting position of double encoding in nucleotide index
+# `start_pos_prior` is a distribution over the starting position of double encoding in nucleotide index
+#   - `None`: sample starting positions uniformly
+#   - a number: fix the starting position
+#   - an array: sample starting positions with prob = `start_pos_prior` 
 # note: we sample assuming the reading frames overlap with either 1 or 2 nts
-def gibbs_sampler(h_mtx_x, J_mtx_x, h_mtx_y, J_mtx_y, wt_nt_seq, start_pos, lamb=1, num_iter=100000, nt_seq_init=None):
+def gibbs_sampler(h_mtx_x, J_mtx_x, h_mtx_y, J_mtx_y, wt_nt_seq, start_pos_prior, lamb=1, num_iter=100000, nt_seq_init=None):
     # note: Lx, Ly are lengths of *amino acid sequences*, to get nucleotide sequence length, multiply by 3
     Lx = int(h_mtx_x.size / 21)
     Ly = int(h_mtx_y.size / 21)
-    check_start_pos(Lx, Ly, start_pos)
     assert Lx * 3 == len(wt_nt_seq), 'length of wt_nt_seq needs to be {}'.format(Lx * 3)
 
+    # sample starting positions
+    if start_pos_prior is None:
+        # sample uniformly
+        start_pos_samples = sample_start_pos(Lx, Ly, num_iter + 1)
+    else:
+        try:
+            # fix starting position
+            start_pos = int(start_pos_prior)
+            check_start_pos(Lx, Ly, start_pos)
+            start_pos_samples = np.full(shape=num_iter + 1, fill_value=start_pos)
+        except:
+            # sample based on distribution given by `start_pos_prior`
+            start_pos_samples = sample_start_pos(Lx, Ly, num_iter + 1, start_pos_prior)
+
+    # initialize nt sequence
     if nt_seq_init is None:
         nt_seq = sample_nt_seq(3 * Ly)
-        nt_seq = replace_wt_subseq(wt_nt_seq, nt_seq, start_pos)
+        nt_seq = replace_wt_subseq(wt_nt_seq, nt_seq, start_pos_samples[0])
     else:
         assert len(nt_seq_init) == len(wt_nt_seq)
         nt_seq = nt_seq_init
 
-    nt_seq_samples = [None for i in range(num_iter+1)]
-    energy_x_samples = np.zeros(num_iter+1)
-    energy_y_samples = np.zeros(num_iter+1)
+    nt_seq_samples = [None for i in range(num_iter + 1)]
+    energy_x_samples = np.zeros(num_iter + 1)
+    energy_y_samples = np.zeros(num_iter + 1)
     
-    for i in tqdm(range(num_iter+1)):
+    for i in tqdm(range(num_iter + 1)):
+        start_pos = start_pos_samples[i]
         if i > 0:
             nt_seq = conditional_sampler(nt_seq, h_mtx_x, J_mtx_x, h_mtx_y, J_mtx_y, start_pos, lamb=lamb)
-        # make sure the non-double-encoding region stays the same as the wt
-        assert nt_seq[:start_pos] + nt_seq[start_pos + 3 * Ly:] == wt_nt_seq[:start_pos] + wt_nt_seq[start_pos + 3 * Ly:]
+        # make sure the non-double-encoding region stays the same as the wt (NOT the case if we sample start_pos)
+        # assert nt_seq[:start_pos] + nt_seq[start_pos + 3 * Ly:] == wt_nt_seq[:start_pos] + wt_nt_seq[start_pos + 3 * Ly:]
 
         nt_seq_samples[i] = nt_seq
         seq_x = translate_nt_to_aa(nt_seq)
@@ -420,8 +459,14 @@ def gibbs_sampler(h_mtx_x, J_mtx_x, h_mtx_y, J_mtx_y, wt_nt_seq, start_pos, lamb
         energy_y = compute_energy(seq_y, h_mtx_y, J_mtx_y)
         energy_x_samples[i] = energy_x
         energy_y_samples[i] = energy_y
-    
-    return nt_seq_samples, energy_x_samples, energy_y_samples
+
+    results = {
+        'nt_seq': nt_seq_samples,
+        'energy_x': energy_x_samples,
+        'energy_y': energy_y_samples,
+        'start_pos': start_pos_samples
+    }    
+    return results
 
 
 
