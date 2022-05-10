@@ -1,6 +1,7 @@
 import numpy as np
 from tqdm import tqdm
 from scipy.special import logsumexp
+from joblib import Parallel, delayed, parallel_backend, cpu_count
 from utils import *
 
 
@@ -16,12 +17,12 @@ def compute_conditional_for_position(seq, index, h_mtx, J_mtx, lamb=1, codons_to
     if codons_to_sum is None:
         codons_to_sum = codons
     energy_arr = np.zeros(len(codons_to_sum))
-    seq_tmp = list(seq)
     
+    seq_tmp = list(seq)
     for i, codon in enumerate(codons_to_sum):
         seq_tmp[index] = codon_to_aa[codon]
         energy_arr[i] = compute_energy(''.join(seq_tmp), h_mtx, J_mtx)
-    
+
     energy_arr *= lamb
     return np.exp(energy_arr - logsumexp(energy_arr))
 
@@ -37,7 +38,7 @@ def conditional_sampler(nt_seq, h_mtx_x, J_mtx_x, h_mtx_y, J_mtx_y, start_pos, l
     seq_x = translate_nt_to_aa(nt_list_tmp)
     seq_y = translate_nt_to_aa(nt_list_tmp[start_pos : start_pos + 3 * Ly])
     
-    # i iterates over amino acidx of y
+    # i iterates over amino acids of y
     for i in range(Ly):
         # j iterates over amino acids of x
         # so 3 * j + k - 1 index the kth nt of the jth codon of x (k = 1, 2, 3)
@@ -187,6 +188,8 @@ def run_gibbs_for_lamb(lamb_list, h_mtx_x, J_mtx_x, h_mtx_y, J_mtx_y, wt_nt_seq,
     all_results = {}
     Lx = int(h_mtx_x.size / 21)
     Ly = int(h_mtx_y.size / 21)
+    
+    '''
     for lamb in lamb_list:
         gibbs_results = [None] * num_chains
         for i in range(num_chains):
@@ -199,4 +202,15 @@ def run_gibbs_for_lamb(lamb_list, h_mtx_x, J_mtx_x, h_mtx_y, J_mtx_y, wt_nt_seq,
                                         wt_nt_seq=wt_nt_seq, start_pos=start_pos, lamb=lamb, num_iter=num_mcmc_steps)
             gibbs_results[i] = results
         all_results[lamb] = gibbs_results
+    '''
+
+    # parallelize over chains
+    for lamb in lamb_list:
+        print('lamb: {}'.format(lamb))
+        with parallel_backend('loky', n_jobs=cpu_count()):
+            if lamb == 0:
+                all_results[lamb] = Parallel()(delayed(get_unif_samples)(Lx, Ly, wt_nt_seq, start_pos_samples[i]) for i in range(num_chains))
+            else:
+                all_results[lamb] = Parallel()(delayed(gibbs_sampler)(h_mtx_x, J_mtx_x, h_mtx_y, J_mtx_y, wt_nt_seq, start_pos_samples[i], lamb, num_mcmc_steps) for i in range(num_chains))
+    
     return all_results
