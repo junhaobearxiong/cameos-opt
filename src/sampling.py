@@ -100,38 +100,21 @@ def conditional_sampler(nt_seq, h_mtx_x, J_mtx_x, h_mtx_y, J_mtx_y, start_pos, l
     return ''.join(nt_list_tmp)
 
 
+# one mcmc chain for a given starting position, wt sequence, and fixed temperature
 # sample nt seq s of length 3|x|, where x is obtained by translating the entire sequence s
 # y is obtained by translating the length 3|y| subsequence of s that starts at `start_pos`
 # `wt_nt_seq` is the WT *nt* sequence of x
-# `start_pos_prior` is a distribution over the starting position of double encoding in nucleotide index
-#   - `None`: sample starting positions uniformly
-#   - a number: fix the starting position
-#   - an array: sample starting positions with prob = `start_pos_prior` 
 # note: we sample assuming the reading frames overlap with either 1 or 2 nts
-def gibbs_sampler(h_mtx_x, J_mtx_x, h_mtx_y, J_mtx_y, wt_nt_seq, start_pos_prior, lamb=1, num_iter=100000, nt_seq_init=None):
+def gibbs_sampler(h_mtx_x, J_mtx_x, h_mtx_y, J_mtx_y, wt_nt_seq, start_pos, lamb=1, num_iter=100000, nt_seq_init=None):
     # note: Lx, Ly are lengths of *amino acid sequences*, to get nucleotide sequence length, multiply by 3
     Lx = int(h_mtx_x.size / 21)
     Ly = int(h_mtx_y.size / 21)
     assert Lx * 3 == len(wt_nt_seq), 'length of wt_nt_seq needs to be {}'.format(Lx * 3)
 
-    # sample starting positions
-    if start_pos_prior is None:
-        # sample uniformly
-        start_pos_samples = sample_start_pos(Lx, Ly, num_iter + 1)
-    else:
-        try:
-            # fix starting position
-            start_pos = int(start_pos_prior)
-            check_start_pos(Lx, Ly, start_pos)
-            start_pos_samples = np.full(shape=num_iter + 1, fill_value=start_pos)
-        except:
-            # sample based on distribution given by `start_pos_prior`
-            start_pos_samples = sample_start_pos(Lx, Ly, num_iter + 1, start_pos_prior)
-
     # initialize nt sequence
     if nt_seq_init is None:
         nt_seq = sample_nt_seq(3 * Ly)
-        nt_seq = replace_wt_subseq(wt_nt_seq, nt_seq, start_pos_samples[0])
+        nt_seq = replace_wt_subseq(wt_nt_seq, nt_seq, start_pos)
     else:
         assert len(nt_seq_init) == len(wt_nt_seq)
         nt_seq = nt_seq_init
@@ -141,10 +124,8 @@ def gibbs_sampler(h_mtx_x, J_mtx_x, h_mtx_y, J_mtx_y, wt_nt_seq, start_pos_prior
     energy_y_samples = np.zeros(num_iter + 1)
     
     for i in tqdm(range(num_iter + 1)):
-        start_pos = start_pos_samples[i]
         if i > 0:
             nt_seq = conditional_sampler(nt_seq, h_mtx_x, J_mtx_x, h_mtx_y, J_mtx_y, start_pos, lamb=lamb)
-        # make sure the non-double-encoding region stays the same as the wt (NOT the case if we sample start_pos)
         # assert nt_seq[:start_pos] + nt_seq[start_pos + 3 * Ly:] == wt_nt_seq[:start_pos] + wt_nt_seq[start_pos + 3 * Ly:]
 
         nt_seq_samples[i] = nt_seq
@@ -159,37 +140,63 @@ def gibbs_sampler(h_mtx_x, J_mtx_x, h_mtx_y, J_mtx_y, wt_nt_seq, start_pos_prior
         'nt_seq': nt_seq_samples,
         'energy_x': energy_x_samples,
         'energy_y': energy_y_samples,
-        'start_pos': start_pos_samples
+        'start_pos': start_pos,
+        'wt_nt_seq': wt_nt_seq
     }    
     return results
 
 
-def run_gibbs_for_lamb(lamb_list, h_mtx_x, J_mtx_x, h_mtx_y, J_mtx_y, wt_nt_seq, start_pos_prior, num_iters):
+# `start_pos_prior` is a distribution over the starting position of double encoding in nucleotide index
+#   - `None`: sample starting positions uniformly
+#   - a number: fix the starting position
+#   - an array: sample starting positions with prob = `start_pos_prior` 
+# note: if start_pos is sampled, it would still be fixed for all the gibbs samples
+# for each lambda, we run `num_chains` mcmc chains, each for `num_mcmc_steps`
+# for each chain, we sample a start_pos based on `start_pos_prior` 
+def run_gibbs_for_lamb(lamb_list, h_mtx_x, J_mtx_x, h_mtx_y, J_mtx_y, wt_nt_seq, start_pos_prior, num_chains, num_mcmc_steps):
     # uniformly sample from sequence space, conditioning on wt seq and start pos
-    def get_unif_samples(Lx, Ly, wt_nt_seq, start_pos_prior):
-        if start_pos_prior is None:
-            start_pos_samples = sample_start_pos(Lx, Ly, num_iters + 1)
-        else:
-            start_pos_samples = np.full(num_iters + 1, start_pos_prior)
-        samples = [replace_wt_subseq(wt_nt_seq, sample_nt_seq(3 * Ly), start_pos) for start_pos in start_pos_samples]
+    def get_unif_samples(Lx, Ly, wt_nt_seq, start_pos):
+        samples = [replace_wt_subseq(wt_nt_seq, sample_nt_seq(3 * Ly), start_pos) for _ in range(num_mcmc_steps)]
         energies_x = np.array([compute_energy(translate_nt_to_aa(s), h_mtx_x, J_mtx_x) for s in samples])
-        energies_y = np.array([compute_energy(translate_nt_to_aa(s[start_pos_samples[i] : start_pos_samples[i] + 3 * Ly]), h_mtx_y, J_mtx_y) for i, s in enumerate(samples)])
+        energies_y = np.array([compute_energy(translate_nt_to_aa(s[start_pos : start_pos + 3 * Ly]), h_mtx_y, J_mtx_y) for s in samples])
         results = {
             'nt_seq': samples,
             'energy_x': energies_x,
             'energy_y': energies_y,
-            'start_pos': start_pos_samples
+            'start_pos': start_pos,
+            'wt_nt_seq': wt_nt_seq
         }
         return results
     
-    gibbs_results = {}
     Lx = int(h_mtx_x.size / 21)
     Ly = int(h_mtx_y.size / 21)
-    for i, lamb in enumerate(lamb_list):
-        if lamb == 0:
-            results = get_unif_samples(Lx, Ly, wt_nt_seq, start_pos_prior)
-        else:
-            results = gibbs_sampler(h_mtx_x, J_mtx_x, h_mtx_y, J_mtx_y,
-                                    wt_nt_seq=wt_nt_seq, start_pos_prior=start_pos_prior, lamb=lamb, num_iter=num_iters)
-        gibbs_results[lamb] = results
-    return gibbs_results
+    # sample starting positions
+    if start_pos_prior is None:
+        # sample uniformly
+        start_pos_samples = sample_start_pos(Lx, Ly, num_chains)
+    else:
+        try:
+            # fix starting position
+            start_pos = int(start_pos_prior)
+            check_start_pos(Lx, Ly, start_pos)
+            start_pos_samples = np.full(num_chains, start_pos)
+        except:
+            # sample based on distribution given by `start_pos_prior`
+            start_pos_samples = sample_start_pos(Lx, Ly, num_chains, start_pos_prior)
+
+    all_results = {}
+    Lx = int(h_mtx_x.size / 21)
+    Ly = int(h_mtx_y.size / 21)
+    for lamb in lamb_list:
+        gibbs_results = [None] * num_chains
+        for i in range(num_chains):
+            print('lamb: {}, chain: {}'.format(lamb, i))
+            start_pos = start_pos_samples[i]
+            if lamb == 0:
+                results = get_unif_samples(Lx, Ly, wt_nt_seq, start_pos)
+            else:
+                results = gibbs_sampler(h_mtx_x, J_mtx_x, h_mtx_y, J_mtx_y,
+                                        wt_nt_seq=wt_nt_seq, start_pos=start_pos, lamb=lamb, num_iter=num_mcmc_steps)
+            gibbs_results[i] = results
+        all_results[lamb] = gibbs_results
+    return all_results
