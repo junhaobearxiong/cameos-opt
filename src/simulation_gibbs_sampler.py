@@ -10,9 +10,9 @@ np.random.seed(1)
 Lx = 4
 Ly = 2
 q = 21
-num_chains = 4
-num_mcmc_steps = 10000
-lamb_list = [0, 1, 1.25, 1.5, 3]
+num_chains = 100
+num_mcmc_steps = 5000
+lamb_list = [0, 1, 1.5, 2, 3]
 
 h_mtx_x = sample_h(Lx, q)
 J_mtx_x = sample_J(Lx, q)
